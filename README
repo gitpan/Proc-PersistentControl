@@ -60,6 +60,11 @@ This module requires these other modules and libraries:
   Win32::Job (only on Windows)
   Test (only for "make test")
 
+
+WARNING
+
+Work in progress. The interface might change. Probably there are bugs.
+  
 COPYRIGHT AND LICENCE
 
 Copyright (C) 2014 by Michael Staats

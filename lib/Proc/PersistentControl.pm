@@ -2,7 +2,7 @@ package Proc::PersistentControl; # -*-perl-*-
 #
 # Author: Michael Staats 2014
 #
-# $Id: PersistentControl.pm 417 2014-06-22 08:08:36Z michael $
+# $Id: PersistentControl.pm 693 2014-11-20 15:37:48Z michael $
 #
 
 =head1 NAME
@@ -36,7 +36,9 @@ Proc::PersistentControl - Start and Control Background Processes ("jobs", proces
 =head1 DESCRIPTION
 
 WARNING: This module (and its pod) is beta.
-    
+
+Work in progress. The interface might change. Probably there are bugs.
+
 This module creates background processes and allows to track
 them from multiple invocations of a perl program, i. e. not only
 from the parent.
@@ -52,7 +54,7 @@ A timeout for the processes can be specified.
 This module works on Unix and Windows. On Windows, Win32, Win32::Process
 and Win32::Job is required.
 
-This module is intended to a simple as possible. It should have as
+This module is intended to be as simple as possible. It should have as
 few other modules as prerequisites as possible, only modules
 that are likely to be installed in a "typical" perl installation (i. e.
 core modules, or "standard" Win32 modules on Windows). It should be
@@ -196,7 +198,8 @@ Using this module might interfere with your code if it also installs
 signal handlers, wait()s, etc. So don't do that.
 
 The method to store information about the processes should use a more
-structured data format.
+structured data format (like Persistent::File or so, but no more pre-reqs
+should be added).    
     
 =head1 Examples
 
@@ -222,7 +225,7 @@ use vars qw($VERSION @ISA @EXPORT @EXPORT_OK %EXPORT_TAGS);
 
 @ISA = qw(Exporter);
 
-$VERSION = '0.08';
+$VERSION = '0.9';
 
 use strict;
 use File::Path qw(mkpath rmtree); # legacy interface, works with older perls
@@ -298,7 +301,9 @@ sub _pid_alive($) {
     return 0 if (not $pid or $pid <= 0);
     
     if ($^O !~ /^MSWin/) {
-	return kill(0, $pid);
+	my $ret = kill(0, $pid);
+	warn "_pid_alive: returns $ret" if ($debug);
+	return $ret
     }
     
     # Windows
@@ -313,6 +318,7 @@ sub _pid_alive($) {
 	    return 1;
 	}
     }
+    warn "_pid_alive: returns 0" if ($debug);
     return 0;
 }
 
@@ -375,7 +381,10 @@ sub _unix_spawn {
 	print I "_cmd=", join(",", map { s/([,\\])/\\$1/g; s/\n/\\n/g; $_ }
 			     my @tmp = @cmd), "\n";
 	foreach my $o (keys(%$opt)) {
-	    print I "$o=", $opt->{$o}, "\n";
+	    my $v = $opt->{$o};
+	    $v =~ s/\n/\\n/sg;
+	    $v =~ s/\r/\\r/sg;
+	    print I "$o=$v\n";
 	}
 	close(I);
 
@@ -386,16 +395,19 @@ sub _unix_spawn {
 	    croak "Cannot write '$pdir/STDERR': $!\n";
 	
 	$_unix_grandch_dir = $pdir;
+
+	$0 = 'ppc-nanny ' . join(' ', @cmd);
 	
 	$SIG{CHLD} = \&_unix_chld_sighandler;
 	
 	$_unix_grandch_pid = fork(); # fork again for grandchild
 	if ($_unix_grandch_pid == 0) {
+	    warn "grandchild: \$\$ = $$\n" if ($debug);
 	    #grandchild
 	    $SIG{CHLD} = 'DEFAULT';
 	    setpgrp(0, 0);
 	    exec(@cmd) or
-		croak "Could not exec(", join(', ', @cmd), "\n";
+		croak "Could not exec(", join(', ', @cmd), ")\n";
 	}
 	croak "Cannot fork(): $!\n" if (not defined $_unix_grandch_pid);
 
@@ -408,9 +420,20 @@ sub _unix_spawn {
 	warn "child: \$_unix_grandch_pid = $_unix_grandch_pid\n" if ($debug);
 	
 	my $timeout = $opt->{timeout} ? int($opt->{timeout}) : 86400000;
-	sleep($timeout); # will be interrupted by SIGCHLD, this is what we want
+	select(undef, undef, undef, 0.1); # give child some time
+	if (kill(0, $_unix_grandch_pid)) {
+	    # sleep only if process is still alive
+	    # it might have terminated very quickly (e. g. if exec fails)
+	    warn "$$: sleep($timeout) at ", scalar(localtime), "\n" if ($debug);
+	    sleep($timeout); # will be interrupted by SIGCHLD, this is what we want
+	}
+	warn "$$: sleep terminated at ", scalar(localtime), "\n" if ($debug);
 	if (kill(0, $_unix_grandch_pid)) {
 	    carp "ProcPersCtrl:$$: Child $_unix_grandch_pid is alive after $timeout s, killing it\n";
+	    open(I, '>>', $pdir . '/info') or
+		croak "Cannot append to '$pdir/info': $!\n";
+	    print I "_timed_out=1\n";
+	    close(I);
 	    _unix_kill($_unix_grandch_pid);
 	}
 	exit(0);
@@ -455,7 +478,10 @@ sub _win_spawn {
     print I "_cmd=", join(",", map { s/([,\\])/\\$1/g; s/\n/\\n/g; $_ }
 			  my @tmp = @cmd), "\n";
     foreach my $o (keys(%$opt)) {
-	print I "$o=", $opt->{$o}, "\n";
+	my $v = $opt->{$o};
+	$v =~ s/\n/\\n/sg;
+	$v =~ s/\r/\\r/sg;
+	print I "$o=$v\n";
     }
     close(I);
     
@@ -637,6 +663,12 @@ sub StartProc {
 
     my $sdir = $self->{sdir};
 
+    my $w = "Invalid option to StartProc(): Option should not";
+    foreach my $o (keys(%$opt)) {
+	carp "$w contain '='"    if ($o =~ m/=/);
+	carp "$w start with '_'" if ($o =~ m/^_/);
+    }
+    
     print "ProcPersCtrl: StartProc command '", join(' ', @cmd), "'\n"
 	if ($self->{_opts}->{verbose});	
 
@@ -659,15 +691,6 @@ sub StartProc {
     };
     bless $Proc, 'Proc::PersistentControl::Proc';
 
-    select(undef, undef, undef, 0.01);
-    # wait max 1 sec until process has started before returning
-    for (my $nwait = 0; $nwait < 10; $nwait++) {
-	last if ($Proc->IsAlive());
-	warn "Process not alive after starting ($nwait)" if ($debug);
-	select(undef, undef, undef, 0.1);
-    }
-    carp "Process for command '", , join(' ', @cmd), "' seems to be not alive..."
-	unless ($Proc->IsAlive());
     return $Proc;
 }
 

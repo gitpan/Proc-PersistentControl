@@ -132,6 +132,7 @@ my $RC = $job->status()->{$pid}->{exitcode};
 open(RC, '>', $dir . "/RC=$RC"); close(RC);
 open(I, '>>', $dir . "/info");
 print I "_endtime=", time(), "\n";
+print I "_timed_out=1\n" if ($RC == 293);
 close(I);
 close($out);
 close($err);
