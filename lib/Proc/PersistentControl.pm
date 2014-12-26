@@ -2,7 +2,7 @@ package Proc::PersistentControl; # -*-perl-*-
 #
 # Author: Michael Staats 2014
 #
-# $Id: PersistentControl.pm 693 2014-11-20 15:37:48Z michael $
+# $Id: PersistentControl.pm 705 2014-12-16 15:41:21Z michael $
 #
 
 =head1 NAME
@@ -225,7 +225,7 @@ use vars qw($VERSION @ISA @EXPORT @EXPORT_OK %EXPORT_TAGS);
 
 @ISA = qw(Exporter);
 
-$VERSION = '0.9';
+$VERSION = '0.93';
 
 use strict;
 use File::Path qw(mkpath rmtree); # legacy interface, works with older perls
@@ -257,6 +257,9 @@ sub new {
 	$opthash{verbose} = 1;
 	$debug = 1;
     }
+
+    $opthash{nannyname}  ||= 'ppc-nanny';
+    $opthash{closefdmax} ||= 12;
     
     my $self   = { _opts => \%opthash };
     $self->{sdir}    = $opthash{directory};
@@ -335,9 +338,11 @@ sub _unix_intr_sighandler {
     $SIG{INT}  = 'IGNORE';
     $SIG{QUIT} = 'IGNORE';
     $SIG{TERM} = 'IGNORE';
-    
-    carp "$0:ProcPersCtrl:$$: Caught SIG$sig, killing '$_unix_grandch_pid'...\n";
-    _unix_kill($_unix_grandch_pid); # calls the CHLD handler...
+
+    if ($_unix_grandch_pid) {
+	carp "$0:ProcPersCtrl:$$: Caught SIG$sig, killing '$_unix_grandch_pid'...\n";
+	_unix_kill($_unix_grandch_pid); # calls the CHLD handler...
+    }
     exit(0);
 }
 
@@ -349,6 +354,7 @@ sub _unix_chld_sighandler {
 	    if ($debug);
 	if ($child == $_unix_grandch_pid) {
 	    # this is what we have been waiting for
+	    $_unix_grandch_pid = undef;
 	    open(RC, '>', $_unix_grandch_dir . "/RC=$RC"); close(RC);
 	    open(I, '>>', $_unix_grandch_dir . "/info");
 	    print I "_endtime=", time(), "\n";
@@ -393,10 +399,16 @@ sub _unix_spawn {
 	    croak "Cannot write '$pdir/STDOUT': $!\n";
 	open(STDERR, '>', $pdir . '/STDERR') or
 	    croak "Cannot write '$pdir/STDERR': $!\n";
+
+	if ($opt->{_closefdmax} >= 3) {
+	    for (my $fd = 3; $fd <= $opt->{_closefdmax}; $fd++) {
+		POSIX::close($fd);
+	    }
+	}
 	
 	$_unix_grandch_dir = $pdir;
 
-	$0 = 'ppc-nanny ' . join(' ', @cmd);
+	$0 = $opt->{nannyname} . ' ' . join(' ', @cmd);
 	
 	$SIG{CHLD} = \&_unix_chld_sighandler;
 	
@@ -420,15 +432,22 @@ sub _unix_spawn {
 	warn "child: \$_unix_grandch_pid = $_unix_grandch_pid\n" if ($debug);
 	
 	my $timeout = $opt->{timeout} ? int($opt->{timeout}) : 86400000;
-	select(undef, undef, undef, 0.1); # give child some time
-	if (kill(0, $_unix_grandch_pid)) {
-	    # sleep only if process is still alive
-	    # it might have terminated very quickly (e. g. if exec fails)
-	    warn "$$: sleep($timeout) at ", scalar(localtime), "\n" if ($debug);
-	    sleep($timeout); # will be interrupted by SIGCHLD, this is what we want
+	my $maxtime = time + $timeout;
+
+	# $_unix_grandch_pid will be set to undef in the sighandler
+	while ($_unix_grandch_pid and time < $maxtime) {
+	    my $remain = $maxtime - time;
+	    # check each min to avoid race condition, see below
+	    $remain = 60 if ($remain > 60); 
+	    warn "$$: sleep($remain) at ", scalar(localtime), "\n" if ($debug);
+	    sleep($remain) # will be interrupted by SIGCHLD, this is what we want
+		           # but if the sighandler jumps in exactly HERE
+		           # we still have a race cond.
+		           # That's why we sleep at most 60 s
+		if ($_unix_grandch_pid); # just to be sure...
 	}
-	warn "$$: sleep terminated at ", scalar(localtime), "\n" if ($debug);
-	if (kill(0, $_unix_grandch_pid)) {
+	warn "$$: after sleep loop at ", scalar(localtime), "\n" if ($debug);
+	if ($_unix_grandch_pid) {
 	    carp "ProcPersCtrl:$$: Child $_unix_grandch_pid is alive after $timeout s, killing it\n";
 	    open(I, '>>', $pdir . '/info') or
 		croak "Cannot append to '$pdir/info': $!\n";
@@ -679,7 +698,9 @@ sub StartProc {
     $psd =~ m/.*(PPC-.*)/;
     my $UID = $1;
 
-    $opt->{_PPCUID} = $UID;
+    $opt->{_PPCUID}       = $UID;
+    $opt->{nannyname}   ||= $self->{_opts}->{nannyname};
+    $opt->{_closefdmax}   = $self->{_opts}->{closefdmax};
     
     ($^O !~ /^MSWin/) ?
 	_unix_spawn($psd, $opt, @cmd) :
